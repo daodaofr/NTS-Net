@@ -9,6 +9,7 @@ from config import CAT_NUM, PROPOSAL_NUM
 
 
 class ProposalNet(nn.Module):
+    # calculate the confidence score for region proposals
     def __init__(self):
         super(ProposalNet, self).__init__()
         self.down1 = nn.Conv2d(2048, 128, 3, 1, 1)
@@ -36,16 +37,24 @@ class attention_net(nn.Module):
         self.pretrained_model = resnet.resnet50(pretrained=True)
         self.pretrained_model.avgpool = nn.AdaptiveAvgPool2d(1)
         self.pretrained_model.fc = nn.Linear(512 * 4, 200)
-        self.proposal_net = ProposalNet()
+        #proposal_net: calculate the confidence score for all region proposals
+        self.proposal_net = ProposalNet()    
         self.topN = topN
+        #concat_net: output classification scores with original feature and part features
         self.concat_net = nn.Linear(2048 * (CAT_NUM + 1), 200)
+        #particls_net: output classification score for each part feature
         self.partcls_net = nn.Linear(512 * 4, 200)
+        #edge_anchors: anchor proposals using edge coordinates[top_left_y, top_left_x, bottom_right_y, bottom_right_x]
         _, edge_anchors, _ = generate_default_anchor_maps()
         self.pad_side = 224
         self.edge_anchors = (edge_anchors + 224).astype(np.int)
 
     def forward(self, x):
+        #resnet_out: 200 classification score
+        # rpn_fature: 2048*14*14 feature map
+        # feature: 2048 pooled feature
         resnet_out, rpn_feature, feature = self.pretrained_model(x)
+        #pad orignal image with zero , why? To facilite cropping?
         x_pad = F.pad(x, (self.pad_side, self.pad_side, self.pad_side, self.pad_side), mode='constant', value=0)
         batch = x.size(0)
         # we will reshape rpn to shape: batch * nb_anchor
@@ -53,11 +62,15 @@ class attention_net(nn.Module):
         all_cdds = [
             np.concatenate((x.reshape(-1, 1), self.edge_anchors.copy(), np.arange(0, len(x)).reshape(-1, 1)), axis=1)
             for x in rpn_score.data.cpu().numpy()]
+        #find the topN best proposals with overlap lower than iou_thresh
         top_n_cdds = [hard_nms(x, topn=self.topN, iou_thresh=0.25) for x in all_cdds]
         top_n_cdds = np.array(top_n_cdds)
+        #top_n_index: index of the topN proposals
         top_n_index = top_n_cdds[:, :, -1].astype(np.int)
         top_n_index = torch.from_numpy(top_n_index).cuda()
+        #top_n_prob: confidence of the topN proposals
         top_n_prob = torch.gather(rpn_score, dim=1, index=top_n_index)
+        #part_imgs: crop the proposals from the original image
         part_imgs = torch.zeros([batch, self.topN, 3, 224, 224]).cuda()
         for i in range(batch):
             for j in range(self.topN):
@@ -65,6 +78,7 @@ class attention_net(nn.Module):
                 part_imgs[i:i + 1, j] = F.interpolate(x_pad[i:i + 1, :, y0:y1, x0:x1], size=(224, 224), mode='bilinear',
                                                       align_corners=True)
         part_imgs = part_imgs.view(batch * self.topN, 3, 224, 224)
+        #part_features: 2048-dimensional features of parts
         _, _, part_features = self.pretrained_model(part_imgs.detach())
         part_feature = part_features.view(batch, self.topN, -1)
         part_feature = part_feature[:, :CAT_NUM, ...].contiguous()
